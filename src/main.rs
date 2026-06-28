@@ -65,18 +65,18 @@ async fn main() -> Result<()> {
             let result = runner::run_scenario(scenario, sla * 60).await?;
 
             match result {
-                RunResult::Success { elapsed } => {
-                    println!("\n✓ resolved in {}s", elapsed.as_secs());
+                RunResult::Success { elapsed, hints_used } => {
+                    println!("\n✓ resolved in {}s ({} hints used)", elapsed.as_secs(), hints_used);
                     recorder::record(
                         &scenario.meta.id,
                         recorder::Outcome::Success,
                         Some(elapsed),
-                        0,
+                        hints_used as u8,
                     )?;
                 }
-                RunResult::Timeout => {
-                    println!("\n✗ SLA breached.");
-                    recorder::record(&scenario.meta.id, recorder::Outcome::Timeout, None, 0)?;
+                RunResult::Timeout { hints_used } => {
+                    println!("\n✗ SLA breached ({} hints used).", hints_used);
+                    recorder::record(&scenario.meta.id, recorder::Outcome::Timeout, None, hints_used as u8)?;
                 }
                 RunResult::Abandoned => {
                     println!("\nShell exited before resolution. Run again to retry.");
