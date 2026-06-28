@@ -1,6 +1,6 @@
 [package]
 name = "on-call"
-version = "0.1.0"
+version = "20260628.0.0"
 edition = "2024"
 
 [dependencies]
