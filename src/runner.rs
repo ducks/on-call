@@ -1,8 +1,13 @@
 use crate::scenario::{Scenario, SuccessCondition};
 use anyhow::{bail, Result};
 use std::process::Command;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
+
+const HINT_FLAG: &str = "/tmp/on-call-hint";
 
 pub async fn run_scenario(scenario: &Scenario, sla_seconds: u64) -> Result<RunResult> {
     println!("\n[on-call] starting environment...");
@@ -11,44 +16,75 @@ pub async fn run_scenario(scenario: &Scenario, sla_seconds: u64) -> Result<RunRe
     println!("[on-call] injecting fault...");
     run_script(scenario.break_script())?;
 
-    // Find the primary container to exec into
     let container = primary_container(scenario)?;
+    inject_hint_command(&container)?;
 
     let hr: String = "─".repeat(60);
     println!("\n{hr}");
     println!("PAGE: {}", scenario.meta.page);
     println!("{hr}");
-    println!("SLA: {} minutes\n", sla_seconds / 60);
+    println!("SLA: {} minutes", sla_seconds / 60);
+    if !scenario.meta.hints.is_empty() {
+        println!("Hints available: {} (run get-hint inside the shell)", scenario.meta.hints.len());
+    }
+    println!();
 
-    // Poll for success in a background task, signal when done
     let solved = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
+    let hints_used = Arc::new(AtomicUsize::new(0));
+
     let solved_bg = solved.clone();
     let timed_out_bg = timed_out.clone();
+    let hints_used_bg = hints_used.clone();
     let scenario_dir = scenario.dir.clone();
     let check_script = scenario.check_script();
     let success_condition = scenario.meta.success_condition.clone();
     let success_target = scenario.meta.success_target.clone();
     let deadline = Duration::from_secs(sla_seconds);
+    let hints = scenario.meta.hints.clone();
+    let container_bg = container.clone();
 
     let poller = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         loop {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_secs(2));
 
             if started.elapsed() >= deadline {
                 timed_out_bg.store(true, Ordering::SeqCst);
                 return;
             }
 
-            let ok = match success_condition {
-                SuccessCondition::Http200 => {
-                    Command::new("curl")
-                        .args(["-sf", "--max-time", "4", &success_target])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
+            // Check for hint request
+            let hint_flag_exists = Command::new("docker")
+                .args(["exec", &container_bg, "test", "-f", HINT_FLAG])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if hint_flag_exists {
+                // Remove the flag
+                Command::new("docker")
+                    .args(["exec", &container_bg, "rm", "-f", HINT_FLAG])
+                    .status()
+                    .ok();
+
+                let idx = hints_used_bg.fetch_add(1, Ordering::SeqCst);
+                if let Some(hint) = hints.get(idx) {
+                    println!("\n[hint {}] {}\n", idx + 1, hint);
+                } else {
+                    println!("\n[no more hints available]\n");
+                    // Don't increment past the end
+                    hints_used_bg.fetch_sub(1, Ordering::SeqCst);
                 }
+            }
+
+            // Check success condition
+            let ok = match success_condition {
+                SuccessCondition::Http200 => Command::new("curl")
+                    .args(["-sf", "--max-time", "4", &success_target])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false),
                 SuccessCondition::ExitZero => {
                     if check_script.exists() {
                         Command::new("bash")
@@ -70,31 +106,49 @@ pub async fn run_scenario(scenario: &Scenario, sla_seconds: u64) -> Result<RunRe
         }
     });
 
-    // Drop the player into the container
     let started = Instant::now();
     Command::new("docker")
-        .args(["exec", "-it", &container, "sh", "-c",
-               "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh"])
+        .args([
+            "exec",
+            "-it",
+            &container,
+            "sh",
+            "-c",
+            "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh",
+        ])
         .status()
         .ok();
 
-    // Shell exited - check outcome
     poller.abort();
 
-    if solved.load(Ordering::SeqCst) {
-        let elapsed = started.elapsed();
-        compose_down(scenario)?;
-        return Ok(RunResult::Success { elapsed });
-    }
+    let elapsed = started.elapsed();
+    let used = hints_used.load(Ordering::SeqCst);
 
-    if timed_out.load(Ordering::SeqCst) {
-        compose_down(scenario)?;
-        return Ok(RunResult::Timeout);
-    }
-
-    // Player exited the shell manually before solving
     compose_down(scenario)?;
+
+    if solved.load(Ordering::SeqCst) {
+        return Ok(RunResult::Success { elapsed, hints_used: used });
+    }
+    if timed_out.load(Ordering::SeqCst) {
+        return Ok(RunResult::Timeout { hints_used: used });
+    }
     Ok(RunResult::Abandoned)
+}
+
+fn inject_hint_command(container: &str) -> Result<()> {
+    // Write a tiny script to /usr/local/bin/get-hint so it works in both bash and sh
+    let script = "#!/bin/sh\ntouch /tmp/on-call-hint\necho 'Hint requested...'";
+    Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            &format!("printf '{}' > /usr/local/bin/get-hint && chmod +x /usr/local/bin/get-hint", script),
+        ])
+        .status()
+        .ok();
+    Ok(())
 }
 
 fn primary_container(scenario: &Scenario) -> Result<String> {
@@ -109,8 +163,6 @@ fn primary_container(scenario: &Scenario) -> Result<String> {
         .filter(|l| !l.is_empty())
         .collect();
 
-    // Use the container named after the primary service if specified,
-    // otherwise just take the first one
     let target = scenario.meta.shell_service.as_deref().unwrap_or("");
 
     if !target.is_empty() {
@@ -164,7 +216,7 @@ fn run_script(path: std::path::PathBuf) -> Result<()> {
 }
 
 pub enum RunResult {
-    Success { elapsed: Duration },
-    Timeout,
+    Success { elapsed: Duration, hints_used: usize },
+    Timeout { hints_used: usize },
     Abandoned,
 }
