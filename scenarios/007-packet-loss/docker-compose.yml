@@ -1,0 +1,18 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    environment:
+      BACKEND_URL: http://backend:9000/ping
+    ports:
+      - "8080:8080"
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - backend
