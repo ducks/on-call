@@ -46,7 +46,7 @@ pub fn record(
     Ok(())
 }
 
-fn sessions_dir() -> PathBuf {
+pub fn sessions_dir() -> PathBuf {
     dirs_next::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("replaybook")

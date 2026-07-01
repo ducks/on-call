@@ -166,10 +166,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Export => {
-            let path = std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-                .join(".local/share/replaybook/sessions/sessions.jsonl");
+            let path = recorder::sessions_dir().join("sessions.jsonl");
 
             if !path.exists() {
                 println!("No sessions recorded yet.");
