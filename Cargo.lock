@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "replaybook"
-version = "20260630.0.0"
+version = "20260701.0.0"
 dependencies = [
  "anyhow",
  "chrono",
